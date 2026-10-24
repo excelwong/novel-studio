@@ -321,6 +321,11 @@ class NovelStudio:
         self.q = queue.Queue()
         self.busy = False
         self.abort_evt = threading.Event()   # 流式生成中止信号
+        # 摘要/正文编辑器的「上次装载内容」跟踪，用于切换时保护未保存修改
+        self._sum_loaded = None      # 摘要编辑框上次装载的文本（None=尚无基准）
+        self._draft_loaded = None    # 正文编辑框上次装载的文本（None=流式中/无基准）
+        self._sum_ch = None          # 摘要编辑框当前章节号
+        self._draft_ch = None        # 正文编辑框当前章节号
 
         self._build_ui()
         self.root.after(120, self._poll_queue)
@@ -349,6 +354,9 @@ class NovelStudio:
         self._build_outline()
         self._build_summary()
         self._build_draft()
+
+        # 切换到摘要/正文页时自动装载当前章节内容（首次默认第 1 章）
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self.status = tk.Label(self.root, text="就绪。请先在『1.设置与项目』新建或打开项目。",
                                anchor="w", bd=1, relief="sunken")
@@ -679,6 +687,8 @@ class NovelStudio:
         self.current_ch = rec["章节"] if rec["章节"] <= len(self.outline) else None
         write_text(self._project_paths()["outline"], json.dumps(self.outline, ensure_ascii=False, indent=2))
         self._refresh_outline_list()
+        self._refresh_sum_list()      # 新增大纲章后，摘要/正文页下拉立即可选
+        self._refresh_draft_list()
         self.set_status("第 %d 章大纲已保存（共 %d 章）。" % (rec["章节"], len(self.outline)))
 
     def del_outline(self):
@@ -692,6 +702,8 @@ class NovelStudio:
         write_text(self._project_paths()["outline"], json.dumps(self.outline, ensure_ascii=False, indent=2))
         self.new_outline()
         self._refresh_outline_list()
+        self._refresh_sum_list()
+        self._refresh_draft_list()
 
     # ---- Tab5 摘要 ----
     def _build_summary(self):
@@ -704,12 +716,13 @@ class NovelStudio:
         self.var_overwrite = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="覆盖已有摘要", variable=self.var_overwrite).pack(side="left")
         ttk.Button(top, text="AI 批量生成全部章节摘要", command=self.gen_all_summaries).pack(side="left", padx=8)
-        ttk.Button(top, text="AI 重新生成本章", command=self.gen_one_summary).pack(side="left")
+        ttk.Button(top, text="保存本章摘要", command=self.save_summary).pack(side="left")
+        ttk.Button(top, text="AI 重新生成本章", command=self.gen_one_summary).pack(side="left", padx=8)
 
         row2 = ttk.Frame(f)
         row2.pack(fill="x", padx=8, pady=2)
         ttk.Label(row2, text="章节：").pack(side="left")
-        self.cmb_sum = ttk.Combobox(row2, width=10, state="readonly",
+        self.cmb_sum = ttk.Combobox(row2, width=12, state="readonly",
                                     values=[], postcommand=self._refresh_sum_list)
         self.cmb_sum.pack(side="left", padx=(0, 8))
         self.cmb_sum.bind("<<ComboboxSelected>>", lambda e: self.load_summary())
@@ -717,7 +730,6 @@ class NovelStudio:
         self.var_revise = tk.StringVar()
         ttk.Entry(row2, textvariable=self.var_revise, width=44).pack(side="left", padx=4)
         ttk.Button(row2, text="AI 修订本章摘要", command=self.revise_summary).pack(side="left", padx=4)
-        ttk.Button(row2, text="保存本章摘要", command=self.save_summary).pack(side="left", padx=12)
 
         self.txt_summary = tk.Text(f, wrap="word")
         self.txt_summary.pack(fill="both", expand=True, padx=8, pady=6)
@@ -728,7 +740,7 @@ class NovelStudio:
         top = ttk.Frame(f)
         top.pack(fill="x", padx=8, pady=6)
         ttk.Label(top, text="章节：").pack(side="left")
-        self.cmb_draft = ttk.Combobox(top, width=10, state="readonly",
+        self.cmb_draft = ttk.Combobox(top, width=12, state="readonly",
                                       values=[], postcommand=self._refresh_draft_list)
         self.cmb_draft.pack(side="left", padx=(0, 8))
         self.cmb_draft.bind("<<ComboboxSelected>>", lambda e: self.load_draft())
@@ -747,10 +759,15 @@ class NovelStudio:
         ttk.Button(top, text="保存本章正文", command=self.save_draft).pack(side="left")
         ttk.Button(top, text="导出全文 md", command=self.export_all).pack(side="left", padx=8)
 
-        mid = ttk.LabelFrame(f, text=" 本章摘要（只读，在『5.章节摘要』页修改） ")
+        mid = ttk.LabelFrame(f, text=" 本章摘要（只读，在『6.章节摘要』页修改） ")
         mid.pack(fill="x", padx=8, pady=4)
-        self.txt_sum_prev = tk.Text(mid, wrap="word", height=6, bg="#fafafa")
-        self.txt_sum_prev.pack(fill="x", padx=4, pady=4)
+        sframe = tk.Frame(mid)
+        sframe.pack(fill="x", padx=4, pady=4)
+        self.txt_sum_prev = tk.Text(sframe, wrap="word", height=10, bg="#fafafa")
+        sb_prev = ttk.Scrollbar(sframe, orient="vertical", command=self.txt_sum_prev.yview)
+        self.txt_sum_prev.config(yscrollcommand=sb_prev.set)
+        sb_prev.pack(side="right", fill="y")
+        self.txt_sum_prev.pack(side="left", fill="x", expand=True)
 
         bot = ttk.LabelFrame(f, text=" 本章正文（生成后可在此直接编辑，保存后写入 drafts/） ")
         bot.pack(fill="both", expand=True, padx=8, pady=4)
@@ -1455,15 +1472,66 @@ class NovelStudio:
     def _existing_summaries(self):
         if not self.project_dir:
             return []
-        return sorted(int(fn[2:4]) for fn in os.listdir(self._project_paths()["summaries"])
-                      if re.match(r"ch\d+\.md$", fn))
+        nums = []
+        for fn in os.listdir(self._project_paths()["summaries"]):
+            m = re.match(r"ch(\d+)\.md$", fn)
+            if m:
+                nums.append(int(m.group(1)))
+        return sorted(nums)
+
+    def _all_chapter_nums(self):
+        """章节下拉数据源：已有摘要章节 ∪ 剧情大纲章节（新增大纲章立即可选）。"""
+        nums = set(self._existing_summaries())
+        for r in getattr(self, "outline", None) or []:
+            try:
+                nums.add(int(r.get("章节")))
+            except (TypeError, ValueError):
+                pass
+        return sorted(nums)
 
     def _refresh_sum_list(self):
-        self.cmb_sum["values"] = ["第%d章" % n for n in self._existing_summaries()]
+        self.cmb_sum["values"] = ["第%d章" % n for n in self._all_chapter_nums()]
 
     def _sum_context(self):
         return ("【文风特征】\n%s\n\n【人物档案】\n%s\n\n【人物关系】\n%s\n\n【剧情大纲】\n%s"
                 % (self._style_text(), self._chars_text(), self._rel_text(), self._outline_text()))
+
+    # ---- 编辑器装载辅助（跨页自动装载 + 未保存修改保护） ----
+
+    def _set_editor_text(self, widget, text, which):
+        """把 text 装入摘要/正文编辑框；若当前内容相对上次装载有未保存修改，先确认。
+        which: "sum" / "draft"。返回是否完成装载。"""
+        key = "_sum_loaded" if which == "sum" else "_draft_loaded"
+        last = getattr(self, key)
+        cur = widget.get("1.0", "end").rstrip("\n")
+        if last is not None and cur.strip() and cur != last.rstrip("\n"):
+            if not messagebox.askyesno("确认", "当前编辑内容尚未保存，切换将丢失这些修改。是否继续？"):
+                return False
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        setattr(self, key, text)
+        return True
+
+    def _on_tab_changed(self, _e=None):
+        """切到摘要/正文页时自动装载当前章节（首次默认第 1 章）。"""
+        try:
+            idx = self.nb.index(self.nb.select())
+        except Exception:
+            return
+        if idx == 6:      # 6.章节摘要
+            if not self.project_dir:
+                return
+            self._refresh_sum_list()
+            if not self.cmb_sum.get():
+                vals = self.cmb_sum["values"]
+                if vals:
+                    self.cmb_sum.set(vals[0])
+            self.load_summary()
+        elif idx == 7:    # 7.章节正文
+            if not self.project_dir:
+                return
+            self._refresh_draft_list()
+            self.load_draft()
 
     def gen_all_summaries(self):
         if not self._ensure_project():
@@ -1530,8 +1598,8 @@ class NovelStudio:
     def _after_one_summary(self, n, content):
         parsed = parse_summaries(content)
         text = parsed.get(n, content.strip())
-        self.txt_summary.delete("1.0", "end")
-        self.txt_summary.insert("1.0", text)
+        if self._set_editor_text(self.txt_summary, text, "sum"):
+            self._sum_ch = n
         self.set_status("第 %d 章摘要已生成，请检查修订后点「保存本章摘要」。" % n)
 
     def load_summary(self):
@@ -1539,8 +1607,9 @@ class NovelStudio:
         if not sel:
             return
         n = int(re.findall(r"\d+", sel)[0])
-        self.txt_summary.delete("1.0", "end")
-        self.txt_summary.insert("1.0", read_text(self._summary_path(n)))
+        text = read_text(self._summary_path(n))
+        if self._set_editor_text(self.txt_summary, text, "sum"):
+            self._sum_ch = n
 
     def save_summary(self):
         sel = self.cmb_sum.get()
@@ -1548,8 +1617,17 @@ class NovelStudio:
             messagebox.showwarning("提示", "请先选择章节。")
             return
         n = int(re.findall(r"\d+", sel)[0])
-        write_text(self._summary_path(n), self.txt_summary.get("1.0", "end"))
+        text = self.txt_summary.get("1.0", "end")
+        write_text(self._summary_path(n), text)
+        self._sum_loaded = text
+        self._sum_ch = n
         self.set_status("第 %d 章摘要已保存。" % n)
+        # 跨页同步：正文页若正显示同一章，立即刷新其只读摘要预览
+        if self._cur_chapter() == n:
+            self.txt_sum_prev.config(state="normal")
+            self.txt_sum_prev.delete("1.0", "end")
+            self.txt_sum_prev.insert("1.0", text)
+            self.txt_sum_prev.config(state="disabled")
 
     def revise_summary(self):
         sel = self.cmb_sum.get()
@@ -1562,15 +1640,23 @@ class NovelStudio:
             messagebox.showwarning("提示", "请先填写修订指令。")
             return
         old = self.txt_summary.get("1.0", "end").strip() or read_text(self._summary_path(n))
+        # 修订时带上人物档案与人物关系，防止把关系和人物基本属性搞错（按摘要命中裁剪）
+        hit = self._names_in_summary(old)
+        if hit:
+            chars_md, rel_md = self._chars_text(hit), self._rel_text(hit)
+        else:
+            chars_md, rel_md = self._chars_text(), self._rel_text()
         system = "你是连载小说编辑，负责按作者要求修订章节摘要。"
-        user = ("【原摘要】\n%s\n\n【修订要求】%s\n\n请输出修订后的完整摘要，"
+        user = ("【人物档案】（人物性别、年龄、身份、性格等基本属性必须与此一致，不得张冠李戴）\n%s\n\n"
+                "【人物关系】（双方称谓、关系性质必须与此一致，不得弄错）\n%s\n\n"
+                "【原摘要】\n%s\n\n【修订要求】%s\n\n请输出修订后的完整摘要，"
                 "保持 200~400 字，保留时间地点/人物/事件/看点/钩子结构，只输出摘要正文。"
-                % (old, instruction))
+                % (chars_md, rel_md, old, instruction))
         self.llm_async(system, user, lambda c: self._after_revise(n, c), "修订摘要")
 
     def _after_revise(self, n, content):
-        self.txt_summary.delete("1.0", "end")
-        self.txt_summary.insert("1.0", content.strip())
+        if self._set_editor_text(self.txt_summary, content.strip(), "sum"):
+            self._sum_ch = n
         self.set_status("第 %d 章摘要已按指令修订，确认无误后点「保存本章摘要」。" % n)
 
     # ------------------------------------------------ Tab6 正文
@@ -1579,7 +1665,7 @@ class NovelStudio:
         if not self.project_dir:
             self.cmb_draft["values"] = []
             return
-        nums = self._existing_summaries()
+        nums = self._all_chapter_nums()
         self.cmb_draft["values"] = ["第%d章" % n for n in nums]
         if nums and not self.cmb_draft.get():
             self.cmb_draft.set("第%d章" % nums[0])
@@ -1596,10 +1682,11 @@ class NovelStudio:
             return
         self.txt_sum_prev.config(state="normal")
         self.txt_sum_prev.delete("1.0", "end")
-        self.txt_sum_prev.insert("1.0", read_text(self._summary_path(n), "（本章摘要缺失，请回『5.章节摘要』生成）"))
+        self.txt_sum_prev.insert("1.0", read_text(self._summary_path(n), "（本章摘要缺失，请回『6.章节摘要』生成）"))
         self.txt_sum_prev.config(state="disabled")
-        self.txt_draft.delete("1.0", "end")
-        self.txt_draft.insert("1.0", read_text(os.path.join(self._project_paths()["drafts"], ch_name(n) + ".md")))
+        text = read_text(os.path.join(self._project_paths()["drafts"], ch_name(n) + ".md"))
+        if self._set_editor_text(self.txt_draft, text, "draft"):
+            self._draft_ch = n
 
     def gen_draft(self):
         if not self._ensure_project():
@@ -1610,7 +1697,7 @@ class NovelStudio:
             return
         summary = read_text(self._summary_path(n))
         if not summary.strip():
-            messagebox.showwarning("提示", "该章摘要为空，请先在『5.章节摘要』生成并保存。")
+            messagebox.showwarning("提示", "该章摘要为空，请先在『6.章节摘要』生成并保存。")
             return
         prev_end = ""
         if n > 1 and self.var_carry.get():
@@ -1636,8 +1723,10 @@ class NovelStudio:
                 % (self._style_text(), chars_md, rel_md,
                    n, summary, prev_end, self.var_wc.get(), n))
         def _on_start():
-            # 流式开始：清空正文框，准备逐块显示
+            # 流式开始：清空正文框，准备逐块显示（清空为有意覆盖，重置保护基准）
             self.txt_draft.delete("1.0", "end")
+            self._draft_loaded = None
+            self._draft_ch = n
             self.set_status("正在流式生成第 %d 章正文（%s）…可随时点「中止」" % (n, scope))
 
         def _on_chunk(delta):
@@ -1651,6 +1740,9 @@ class NovelStudio:
 
     def _after_draft(self, n, content):
         text = content.strip()
+        # 兜底剥离个别模型输出的前导 "null" 标记（Android 端同类问题的防御）
+        while text[:4].lower() == "null":
+            text = text[4:].lstrip(" \t\n\r，。")
         if text.startswith("第%d章" % n) is False and "第%d章" % n not in text[:30]:
             text = "第%d章\n\n%s" % (n, text)
         # 流式已逐块显示：内容一致就不重插，避免末尾重复
@@ -1658,6 +1750,8 @@ class NovelStudio:
         if cur != text:
             self.txt_draft.delete("1.0", "end")
             self.txt_draft.insert("1.0", text)
+        self._draft_loaded = text
+        self._draft_ch = n
         self.txt_draft.see("end")
         self.set_status("第 %d 章正文已生成，请审阅修改后点「保存本章正文」。" % n)
 
@@ -1665,8 +1759,10 @@ class NovelStudio:
         n = self._cur_chapter()
         if n is None:
             return
-        write_text(os.path.join(self._project_paths()["drafts"], ch_name(n) + ".md"),
-                   self.txt_draft.get("1.0", "end"))
+        text = self.txt_draft.get("1.0", "end")
+        write_text(os.path.join(self._project_paths()["drafts"], ch_name(n) + ".md"), text)
+        self._draft_loaded = text
+        self._draft_ch = n
         self.set_status("第 %d 章正文已保存。" % n)
 
     def export_all(self):
