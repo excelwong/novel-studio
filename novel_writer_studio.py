@@ -326,6 +326,7 @@ class NovelStudio:
         self._draft_loaded = None    # 正文编辑框上次装载的文本（None=流式中/无基准）
         self._sum_ch = None          # 摘要编辑框当前章节号
         self._draft_ch = None        # 正文编辑框当前章节号
+        self._prompt_ch = -1         # 提示词框当前章节号（换章才重新填充，保留同章编辑）
 
         self._build_ui()
         self.root.after(120, self._poll_queue)
@@ -705,34 +706,26 @@ class NovelStudio:
         self._refresh_sum_list()
         self._refresh_draft_list()
 
-    # ---- Tab5 摘要 ----
+    # ---- Tab5 摘要（提示词透明化模式） ----
     def _build_summary(self):
         f = self.tab_summary
         top = ttk.Frame(f)
         top.pack(fill="x", padx=8, pady=6)
-        ttk.Label(top, text="规划章数：").pack(side="left")
-        self.var_n = tk.StringVar(value="10")
-        ttk.Spinbox(top, from_=1, to=200, width=5, textvariable=self.var_n).pack(side="left", padx=(0, 12))
-        self.var_overwrite = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="覆盖已有摘要", variable=self.var_overwrite).pack(side="left")
-        ttk.Button(top, text="AI 批量生成全部章节摘要", command=self.gen_all_summaries).pack(side="left", padx=8)
-        ttk.Button(top, text="保存本章摘要", command=self.save_summary).pack(side="left")
-        ttk.Button(top, text="AI 重新生成本章", command=self.gen_one_summary).pack(side="left", padx=8)
-
-        row2 = ttk.Frame(f)
-        row2.pack(fill="x", padx=8, pady=2)
-        ttk.Label(row2, text="章节：").pack(side="left")
-        self.cmb_sum = ttk.Combobox(row2, width=12, state="readonly",
+        ttk.Label(top, text="章节：").pack(side="left")
+        self.cmb_sum = ttk.Combobox(top, width=12, state="readonly",
                                     values=[], postcommand=self._refresh_sum_list)
         self.cmb_sum.pack(side="left", padx=(0, 8))
         self.cmb_sum.bind("<<ComboboxSelected>>", lambda e: self.load_summary())
-        ttk.Label(row2, text="AI 修订指令（如：把冲突加强，结尾钩子更狠）：").pack(side="left")
-        self.var_revise = tk.StringVar()
-        ttk.Entry(row2, textvariable=self.var_revise, width=44).pack(side="left", padx=4)
-        ttk.Button(row2, text="AI 修订本章摘要", command=self.revise_summary).pack(side="left", padx=4)
+        ttk.Button(top, text="保存本章摘要", command=self.save_summary).pack(side="left")
 
+        ttk.Label(f, text="生成本章摘要的提示词（选择章节时自动填充，可编辑）：").pack(anchor="w", padx=8)
+        self.txt_prompt = tk.Text(f, wrap="word", height=12)
+        self.txt_prompt.pack(fill="x", padx=8, pady=(2, 4))
+        ttk.Button(f, text="按此提示词生成本章摘要", command=self.run_summary_prompt).pack(pady=2)
+
+        ttk.Label(f, text="本章摘要：").pack(anchor="w", padx=8)
         self.txt_summary = tk.Text(f, wrap="word")
-        self.txt_summary.pack(fill="both", expand=True, padx=8, pady=6)
+        self.txt_summary.pack(fill="both", expand=True, padx=8, pady=(2, 6))
 
     # ---- Tab6 正文 ----
     def _build_draft(self):
@@ -1533,54 +1526,56 @@ class NovelStudio:
             self._refresh_draft_list()
             self.load_draft()
 
-    def gen_all_summaries(self):
-        if not self._ensure_project():
-            return
-        if self.rels:
-            write_text(self._project_paths()["rel"], json.dumps(self.rels, ensure_ascii=False, indent=2))
-        if self.outline:
-            write_text(self._project_paths()["outline"], json.dumps(self.outline, ensure_ascii=False, indent=2))
-        n = int(self.var_n.get())
-        sdir = self._project_paths()["summaries"]
-        if not self.var_overwrite.get():
-            existing = self._existing_summaries()
-            if existing:
-                if not messagebox.askyesno("确认",
-                        "已有 %d 章摘要，勾选了跳过则只补缺失章节。\n继续？" % len(existing)):
-                    return
-        system = "你是经验丰富的连载小说策划编辑。"
-        user = ("%s\n\n任务：规划并撰写第 1 至第 %d 章的章节摘要。"
-                "每章摘要 200~400 字，必须包含：时间地点、出场人物、核心事件、"
-                "剧情看点/冲突、本章结尾悬念（钩子）。大纲已给到哪章就写到哪章；"
-                "若大纲不足 %d 章，请按主线合理延展。\n\n"
-                "输出格式必须严格为每章一段（不要其他说明文字）：\n"
-                "第1章摘要：<内容>\n第2章摘要：<内容>\n……"
-                % (self._sum_context(), n, n))
-        self.llm_async(system, user, self._after_gen_all, "批量生成章节摘要")
+    def _outline_chapter(self, n):
+        for r in getattr(self, "outline", None) or []:
+            if str(r.get("章节", "")).strip() == str(n):
+                return r
+        return None
 
-    def _after_gen_all(self, content):
-        parsed = parse_summaries(content)
-        if not parsed:
-            messagebox.showwarning("提示", "未能从 AI 输出中解析出章节摘要，原文已放入摘要编辑框，"
-                                           "请检查模型输出或重试。")
-            self.txt_summary.delete("1.0", "end")
-            self.txt_summary.insert("1.0", content)
-            return
-        skip = []
-        for n, text in sorted(parsed.items()):
-            p = self._summary_path(n)
-            if os.path.exists(p) and not self.var_overwrite.get():
-                skip.append(n)
-                continue
-            write_text(p, text)
-        self._refresh_sum_list()
-        msg = "已写入 %d 章摘要。" % (len(parsed) - len(skip))
-        if skip:
-            msg += "（第 %s 章已存在被跳过，可勾选「覆盖已有摘要」重试）" % "、".join(map(str, skip))
-        self.set_status(msg)
-        messagebox.showinfo("完成", msg + "\n\n请务必逐章检查修订后保存。")
+    @staticmethod
+    def _outline_line(r):
+        if not r:
+            return None
+        return "第%s章｜%s｜%s｜%s｜%s｜%s｜%s｜%s" % (
+            r.get("章节", ""), r.get("标题", ""), r.get("时间", ""), r.get("人物", ""),
+            r.get("地点", ""), r.get("事件", ""), r.get("冲突/看点", ""), r.get("结尾钩子", ""))
 
-    def gen_one_summary(self):
+    def _summary_prompt(self, n):
+        """生成「第 n 章摘要」的提示词：透明展示如何从上一环节的剧情大纲生成本章摘要，
+        在第 6 页提示词编辑框中展示，用户可修改后直接执行。"""
+        cur = self._outline_chapter(n)
+        # 本章出场人物：大纲「人物」字段与人物档案求交，只带本章相关档案/关系
+        people = [p for p in re.split(r"[、，,;；/\s]+", (cur or {}).get("人物", "") or "") if p]
+        char_names = {c.get("姓名", "").strip() for c in self.chars if c.get("姓名", "").strip()}
+        hit = {p for p in people if p in char_names}
+        chars_md = self._chars_text(hit) if hit else self._chars_text()
+        rel_md = self._rel_text(hit) if hit else self._rel_text()
+        cur_line = self._outline_line(cur) or \
+            ("（剧情大纲中暂无第 %d 章，请根据人物档案与前后文合理撰写本章内容）" % n)
+        if n == 1:
+            prev_line = "（本章为第 1 章，无上一章；可在摘要开头适当交代开篇背景）"
+        else:
+            prev_line = self._outline_line(self._outline_chapter(n - 1)) or \
+                ("（大纲中暂无第 %d 章；请保证与已有前文自然衔接）" % (n - 1))
+        return (
+            "任务：根据「第 %d 章大纲」撰写本章摘要（300~400 字）。\n\n"
+            "【生成方法】\n"
+            "1. 以「第 %d 章大纲」为主体：把时间地点、出场人物、核心事件、冲突/看点、结尾钩子扩写成连贯的摘要叙述；\n"
+            "2. 参考「上一章大纲」保证与前文自然衔接；\n"
+            "3. 出场人物以大纲「人物」字段为准：其性别、年龄、身份、性格等基本属性取自下方人物档案，"
+            "双方称谓与关系取自人物关系表，不得张冠李戴；\n"
+            "4. 摘要文字风格参照文风特征；\n"
+            "5. 摘要须完整包含：时间地点、出场人物、核心事件、剧情看点/冲突、本章结尾悬念（钩子）。\n\n"
+            "【文风特征】\n%s\n\n"
+            "【人物档案】（本章出场人物）\n%s\n\n"
+            "【人物关系】（本章相关）\n%s\n\n"
+            "【上一章大纲】（衔接参考）\n%s\n\n"
+            "【第 %d 章大纲】（摘要主体）\n%s\n\n"
+            "输出格式：第%d章摘要：<内容>（不要其他说明文字）。"
+            % (n, n, self._style_text(), chars_md, rel_md, prev_line, n, cur_line, n))
+
+    def run_summary_prompt(self):
+        """按提示词编辑框中的内容（用户可改）生成本章摘要。"""
         if not self._ensure_project():
             return
         sel = self.cmb_sum.get()
@@ -1588,25 +1583,30 @@ class NovelStudio:
             messagebox.showwarning("提示", "请先选择章节。")
             return
         n = int(re.findall(r"\d+", sel)[0])
+        prompt = self.txt_prompt.get("1.0", "end").strip()
+        if not prompt:
+            messagebox.showwarning("提示", "提示词为空，请先选择章节自动填充，或手动填写。")
+            return
         system = "你是经验丰富的连载小说策划编辑。"
-        user = ("%s\n\n任务：只撰写第 %d 章摘要（300~400 字），包含：时间地点、出场人物、"
-                "核心事件、剧情看点/冲突、结尾钩子。需与前文自然衔接。"
-                "输出格式：第%d章摘要：<内容>（不要其他说明）。"
-                % (self._sum_context(), n, n))
-        self.llm_async(system, user, lambda c: self._after_one_summary(n, c), "生成本章摘要")
+        self.llm_async(system, prompt, lambda c: self._after_one_summary(n, c), "生成本章摘要")
 
     def _after_one_summary(self, n, content):
         parsed = parse_summaries(content)
         text = parsed.get(n, content.strip())
         if self._set_editor_text(self.txt_summary, text, "sum"):
             self._sum_ch = n
-        self.set_status("第 %d 章摘要已生成，请检查修订后点「保存本章摘要」。" % n)
+        self.set_status("第 %d 章摘要已按提示词生成，请检查修订后点「保存本章摘要」。" % n)
 
     def load_summary(self):
         sel = self.cmb_sum.get()
         if not sel:
             return
         n = int(re.findall(r"\d+", sel)[0])
+        # 换章时自动填充提示词（同章保留用户已编辑的内容）
+        if self._prompt_ch != n:
+            self._prompt_ch = n
+            self.txt_prompt.delete("1.0", "end")
+            self.txt_prompt.insert("1.0", self._summary_prompt(n))
         text = read_text(self._summary_path(n))
         if self._set_editor_text(self.txt_summary, text, "sum"):
             self._sum_ch = n
@@ -1628,36 +1628,6 @@ class NovelStudio:
             self.txt_sum_prev.delete("1.0", "end")
             self.txt_sum_prev.insert("1.0", text)
             self.txt_sum_prev.config(state="disabled")
-
-    def revise_summary(self):
-        sel = self.cmb_sum.get()
-        if not sel:
-            messagebox.showwarning("提示", "请先选择章节。")
-            return
-        n = int(re.findall(r"\d+", sel)[0])
-        instruction = self.var_revise.get().strip()
-        if not instruction:
-            messagebox.showwarning("提示", "请先填写修订指令。")
-            return
-        old = self.txt_summary.get("1.0", "end").strip() or read_text(self._summary_path(n))
-        # 修订时带上人物档案与人物关系，防止把关系和人物基本属性搞错（按摘要命中裁剪）
-        hit = self._names_in_summary(old)
-        if hit:
-            chars_md, rel_md = self._chars_text(hit), self._rel_text(hit)
-        else:
-            chars_md, rel_md = self._chars_text(), self._rel_text()
-        system = "你是连载小说编辑，负责按作者要求修订章节摘要。"
-        user = ("【人物档案】（人物性别、年龄、身份、性格等基本属性必须与此一致，不得张冠李戴）\n%s\n\n"
-                "【人物关系】（双方称谓、关系性质必须与此一致，不得弄错）\n%s\n\n"
-                "【原摘要】\n%s\n\n【修订要求】%s\n\n请输出修订后的完整摘要，"
-                "保持 200~400 字，保留时间地点/人物/事件/看点/钩子结构，只输出摘要正文。"
-                % (chars_md, rel_md, old, instruction))
-        self.llm_async(system, user, lambda c: self._after_revise(n, c), "修订摘要")
-
-    def _after_revise(self, n, content):
-        if self._set_editor_text(self.txt_summary, content.strip(), "sum"):
-            self._sum_ch = n
-        self.set_status("第 %d 章摘要已按指令修订，确认无误后点「保存本章摘要」。" % n)
 
     # ------------------------------------------------ Tab6 正文
 
